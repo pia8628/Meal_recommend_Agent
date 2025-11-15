@@ -1,7 +1,56 @@
 """工具函數定義 - 供 ADK Agent 使用"""
 import json
 import os
-from config import get_ingredients_file, get_preferences_file
+import uuid
+from typing import Dict, List
+
+from google.adk.events.event import Event
+from google.adk.sessions.session import Session
+from google.genai import types
+
+from config import get_ingredients_file
+
+
+class _PreferenceStore:
+    """使用於對話期間的偏好暫存。"""
+
+    def __init__(self) -> None:
+        self.likes: List[str] = []
+        self.dislikes: List[str] = []
+
+    def clear(self) -> None:
+        self.likes.clear()
+        self.dislikes.clear()
+
+    def add(self, food: str, like: bool) -> None:
+        key_list = self.likes if like else self.dislikes
+        other_list = self.dislikes if like else self.likes
+
+        if food in other_list:
+            other_list.remove(food)
+
+        if food not in key_list:
+            key_list.append(food)
+
+    def as_dict(self) -> Dict[str, List[str]]:
+        return {
+            "likes": list(self.likes),
+            "dislikes": list(self.dislikes),
+        }
+
+    def has_data(self) -> bool:
+        return bool(self.likes or self.dislikes)
+
+    def summary_lines(self) -> List[str]:
+        lines: List[str] = []
+        if self.likes:
+            lines.append(f"喜歡的食物：{', '.join(self.likes)}")
+        if self.dislikes:
+            lines.append(f"不喜歡的食物：{', '.join(self.dislikes)}")
+        return lines
+
+
+_PREFERENCES = _PreferenceStore()
 
 # 食材管理工具函數
 def add_ingredient(name: str) -> str:
@@ -62,57 +111,76 @@ def list_ingredients() -> str:
 
 # 偏好管理工具函數
 def add_preference(food: str, like: bool = True) -> str:
-    """添加飲食偏好"""
-    preferences_file = get_preferences_file()
-    os.makedirs(os.path.dirname(preferences_file), exist_ok=True)
-    
-    try:
-        with open(preferences_file, 'r', encoding='utf-8') as f:
-            preferences = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        preferences = {"likes": [], "dislikes": []}
-    
-    key = "likes" if like else "dislikes"
-    other_key = "dislikes" if like else "likes"
-    
-    # 如果已經在另一個列表中，先移除
-    if food in preferences[other_key]:
-        preferences[other_key].remove(food)
-    
-    # 添加到對應列表
-    if food not in preferences[key]:
-        preferences[key].append(food)
-    
-    with open(preferences_file, 'w', encoding='utf-8') as f:
-        json.dump(preferences, f, ensure_ascii=False, indent=2)
-    
+    """添加飲食偏好（儲存在對話期間的暫存中）。"""
+    food = food.strip()
+    if not food:
+        return "請提供有效的食物名稱。"
+
+    _PREFERENCES.add(food, like)
     action = "喜歡" if like else "不喜歡"
     return f"已記錄您{action}「{food}」。"
 
-def get_preferences() -> dict:
-    """取得偏好清單"""
-    preferences_file = get_preferences_file()
-    
-    try:
-        with open(preferences_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"likes": [], "dislikes": []}
+
+def get_preferences() -> Dict[str, List[str]]:
+    """取得偏好清單。"""
+    return _PREFERENCES.as_dict()
+
 
 def list_preferences() -> str:
-    """列出偏好清單（格式化）"""
-    preferences = get_preferences()
-    likes = preferences.get("likes", [])
-    dislikes = preferences.get("dislikes", [])
-    
-    result = []
-    if likes:
-        result.append(f"喜歡的食物：{', '.join(likes)}")
-    if dislikes:
-        result.append(f"不喜歡的食物：{', '.join(dislikes)}")
-    
-    if not result:
+    """列出偏好清單（格式化）。"""
+    lines = _PREFERENCES.summary_lines()
+    if not lines:
         return "目前還沒有記錄任何偏好。"
-    
-    return "\n".join(result)
+    return "\n".join(lines)
+
+
+def reset_preferences() -> None:
+    """重設偏好暫存。"""
+    _PREFERENCES.clear()
+
+
+def preferences_available() -> bool:
+    """檢查是否有偏好資料。"""
+    return _PREFERENCES.has_data()
+
+
+def build_preferences_summary() -> str:
+    """組裝偏好摘要文字。"""
+    lines = _PREFERENCES.summary_lines()
+    if not lines:
+        return ""
+    return "用戶偏好紀錄：\n" + "\n".join(lines)
+
+
+async def add_preferences_to_memory(memory_service, *, app_name: str, user_id: str) -> bool:
+    """將目前偏好寫入 Google ADK 記憶服務。"""
+
+    if memory_service is None or not _PREFERENCES.has_data():
+        return False
+
+    summary_text = build_preferences_summary()
+    if not summary_text:
+        return False
+
+    content = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text=summary_text)],
+    )
+
+    event = Event(
+        author="user",
+        content=content,
+        invocation_id=str(uuid.uuid4()),
+    )
+
+    session = Session(
+        id=str(uuid.uuid4()),
+        app_name=app_name,
+        user_id=user_id,
+        state={"preferences": _PREFERENCES.as_dict()},
+        events=[event],
+    )
+
+    await memory_service.add_session_to_memory(session)
+    return True
 
